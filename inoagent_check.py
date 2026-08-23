@@ -25,7 +25,7 @@ MIN_RECORDS = 300
 MAX_DELTA = 0.25
 WINDOW_CHARS = 600
 HEAD_CHARS = 800
-DEFAULT_MIN_CONFIDENCE = 0.6
+DEFAULT_MIN_CONFIDENCE = 0.5
 
 STATUS_MARKERS = (
     'иностранного агента',
@@ -39,6 +39,7 @@ NBSP = '\u00a0'
 SOFT_HYPHEN = '\u00ad'
 
 INDECLINABLE_TAILS = ('ко', 'о', 'е', 'и', 'у', 'ю', 'ых', 'их', 'аго')
+HUSHING = ('ж', 'ч', 'ш', 'щ', 'ц')
 
 
 def norm(text):
@@ -86,15 +87,27 @@ def surname_forms(surname):
         forms.update(s[:-2] + e for e in ('ой', 'ую'))
     elif s.endswith('ой'):
         forms.update(s[:-2] + e for e in ('ого', 'ому', 'ым', 'ом'))
-    elif s.endswith('ь'):
+    elif s.endswith(('й', 'ь')):
         forms.update(s[:-1] + e for e in ('я', 'ю', 'ем', 'е'))
     elif s.endswith('а'):
         forms.update(s[:-1] + e for e in ('ы', 'е', 'у', 'ой'))
     elif s.endswith('я'):
         forms.update(s[:-1] + e for e in ('и', 'ю', 'ей'))
+    elif s.endswith(HUSHING):
+        forms.update(s + e for e in ('а', 'у', 'ем', 'е'))
     else:
         forms.update(s + e for e in ('а', 'у', 'ом', 'е'))
     return forms
+
+
+def parse_date(cell):
+    '''ДД.ММ.ГГГГ или ГГГГ-ММ-ДД в ISO. Иначе пустая строка.'''
+    c = str(cell).strip()
+    if len(c) == 10 and c[2] == '.' and c[5] == '.':
+        return c[6:] + '-' + c[3:5] + '-' + c[:2]
+    if len(c) == 10 and c[4] == '-' and c[7] == '-':
+        return c
+    return ''
 
 
 @dataclass(frozen=True)
@@ -199,14 +212,36 @@ def load_disclaimer(path):
     return norm(' '.join(body))[:80]
 
 
+def head_names_person(head, label):
+    '''Названо ли это лицо в шапке документа.'''
+    parts = [p for p, _, _ in tokenize(label)]
+    if not parts:
+        return False
+    return any(form in head for form in surname_forms(parts[0]))
+
+
 def mark_hits(text, hits, disclaimer_core):
+    '''Маркировка засчитывается в двух случаях:
+
+    1) маркер статуса или тело формы стоит в окне вокруг упоминания;
+    2) плашка стоит в шапке ДОКУМЕНТА И в этой же шапке названо
+       именно это лицо.
+
+    Шапка больше НЕ покрывает все упоминания в тексте: плашка про
+    одного автора ничего не говорит о другом лице, упомянутом ниже.
+    '''
     head = norm(text[:HEAD_CHARS])
+    head_marked = any(m in head for m in STATUS_MARKERS)
+    if disclaimer_core and disclaimer_core in head:
+        head_marked = True
     for hit in hits:
         left = max(0, hit.start - WINDOW_CHARS)
         window = norm(text[left:hit.end + WINDOW_CHARS])
-        found = any(m in window or m in head for m in STATUS_MARKERS)
+        found = any(m in window for m in STATUS_MARKERS)
         if not found and disclaimer_core:
-            found = disclaimer_core in window or disclaimer_core in head
+            found = disclaimer_core in window
+        if not found and head_marked:
+            found = head_names_person(head, hit.label)
         hit.marked = found
     return hits
 
@@ -257,6 +292,10 @@ def load_snapshot(as_of=None, explicit=None):
         records.append(Record(i, row.get('name', ''), row.get('kind', 'person'),
                               row.get('included_on', '')))
     if as_of:
+        undated = sum(1 for r in records if not r.included_on)
+        if undated:
+            print(f'внимание: у {undated} записей снимка нет даты включения, '
+                  'они проверяются без учёта --as-of')
         records = [r for r in records if not r.included_on or r.included_on <= as_of]
     return chosen, payload, records
 
@@ -276,8 +315,9 @@ def parse_rows(rows):
             continue
         included = ''
         for cell in cells[1:]:
-            if len(cell) == 10 and cell[4] in '-.':
-                included = cell.replace('.', '-')
+            parsed = parse_date(cell)
+            if parsed:
+                included = parsed
         kind = 'org' if len(name.split()) > 3 else 'person'
         records.append({'name': name, 'kind': kind, 'included_on': included})
     return records
@@ -338,6 +378,11 @@ def cmd_update(args):
     if len(records) < MIN_RECORDS and not args.force:
         raise SystemExit(f'разобрано {len(records)} записей при пороге {MIN_RECORDS}: похоже, '
                          'формат выгрузки изменился. Снимок не сохранён')
+    dated = sum(1 for r in records if r['included_on'])
+    if not dated and not args.force:
+        raise SystemExit('ни в одной строке не распознана дата включения. Без дат ключ '
+                         '--as-of показал бы текущий реестр вместо исторического. '
+                         'Снимок не сохранён')
     if previous and not args.force:
         old = json.loads(previous[-1].read_text(encoding='utf-8'))
         old_count = max(len(old.get('records', ())), 1)
@@ -346,7 +391,8 @@ def cmd_update(args):
             raise SystemExit(f'расхождение с предыдущим снимком {delta:.0%} при пороге '
                              f'{MAX_DELTA:.0%}. Снимок не сохранён, проверьте выгрузку вручную')
     today = date.today().isoformat()
-    payload = {'fetched_on': today, 'source': source, 'count': len(records), 'records': records}
+    payload = {'fetched_on': today, 'source': source, 'count': len(records),
+               'dated': dated, 'records': records}
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     payload['sha256'] = hashlib.sha256(blob.encode('utf-8')).hexdigest()
     target = SNAPSHOT_DIR / f'{today}.json'
@@ -354,7 +400,8 @@ def cmd_update(args):
     MANIFEST.write_text(json.dumps({'latest': target.name, 'count': len(records),
                                     'sha256': payload['sha256']}, ensure_ascii=False, indent=1),
                         encoding='utf-8')
-    print(f'снимок {target.name}: записей {len(records)}, sha256 {payload["sha256"][:16]}')
+    print(f'снимок {target.name}: записей {len(records)}, с датой включения {dated}, '
+          f'sha256 {payload["sha256"][:16]}')
     return 0
 
 
@@ -366,7 +413,8 @@ def cmd_snapshots(args):
     for path in available:
         payload = json.loads(path.read_text(encoding='utf-8'))
         digest = payload.get('sha256', '')
-        print(f'{path.stem}  записей {payload.get("count", 0)}  sha256 {digest[:16]}')
+        print(f'{path.stem}  записей {payload.get("count", 0)}  '
+              f'с датой {payload.get("dated", 0)}  sha256 {digest[:16]}')
     return 0
 
 
