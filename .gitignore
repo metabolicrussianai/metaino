@@ -1,0 +1,32 @@
+# Снимки реестра и локальное хранилище
+snapshots/
+*.json.source
+registry-*.json
+manifest.json
+
+# Отчёты по чужим документам — никогда не попадают в репозиторий
+reports/
+*.report.md
+*.report.json
+
+# Проверяемые документы: содержат чужие тексты и персональные данные
+*.docx
+*.doc
+*.pdf
+*.srt
+*.vtt
+!docs/**/*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Окружение и СО﻿
+.env
+.DS_Store
+.idea/
+.vscode/
