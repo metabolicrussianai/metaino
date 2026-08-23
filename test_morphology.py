@@ -4,20 +4,22 @@
 Запуск: python test_morphology.py
 Код возврата 1 при любом провале.
 
-Все случаи ниже — настоящие баги, найденные 23.08.2026 прогоном кода:
+Все случаи ниже — настоящие баги, найденные прогоном кода 23.08.2026:
   * фамилии на й давали гайдайа вместо гайдая;
   * творительный на шипящую давал шендеровичом вместо шендеровичем;
   * дата 15.03.2024 не распознавалась, из-за чего --as-of молча
     показывал текущий реестр вместо исторического;
-  * плашка в шапке помечала маркированными ВСЕ упоминания в тексте,
-    включая лиц, к которым она не относится.
+  * плашка в шапке помечала маркированными ВСЕ упоминания в тексте;
+  * после первой правки плашка засчитывалась любому лицу, попавшему
+    в первые 800 символов, — Петрова на 682-м символе получала ложное
+    «покрыто» от плашки про Иванова.
 
 Не удаляйте случаи из этого файла. Каждый стоит за конкретным отказом.
 '''
 import sys
 
 from inoagent_check import (Hit, Record, build_index, find_hits, mark_hits,
-                            parse_date, surname_forms)
+                           named_in_plate, parse_date, plate_block, surname_forms)
 
 FORM_CASES = {
     'Иванов': ('иванова', 'иванову', 'ивановым', 'иванове'),
@@ -49,6 +51,9 @@ DATE_CASES = (
 
 MIN_RECALL = 1.0
 
+PLATE = ('Настоящий материал произведён Ивановым И. И., включённым в реестр '
+         'иностранных агентов.')
+
 failures = []
 
 
@@ -58,6 +63,13 @@ def check(title, condition, detail=''):
     else:
         print('FAIL ' + title + ('  ' + detail if detail else ''))
         failures.append(title)
+
+
+def build_document():
+    '''Типичный репост: плашка про одного автора, третье лицо в середине.'''
+    filler = 'Разговор шёл о новом сезоне и о редакционной политике. ' * 10
+    tail = 'По мнению Петровой М. С., ситуация за год не улучшилась.'
+    return PLATE + '\n' + filler + '\n' + tail
 
 
 def test_forms():
@@ -77,8 +89,7 @@ def test_forms():
 
 def test_base_form_present():
     for base in list(FORM_CASES) + list(INDECLINABLE):
-        forms = surname_forms(base)
-        check('исходная форма сохранена: ' + base, base.lower() in forms)
+        check('исходная форма сохранена: ' + base, base.lower() in surname_forms(base))
 
 
 def test_indeclinable():
@@ -104,28 +115,43 @@ def test_short_surname_found_at_default_threshold():
           'найдено попаданий: ' + str(len(hits)))
 
 
-def build_two_person_document():
-    head = ('Настоящий материал произведён Ивановым И. И., включённым в реестр '
-            'иностранных агентов. ')
-    filler = 'Далее идёт длинный текст интервью. ' * 60
-    tail = 'В финале автор ссылается на Петрову М. С. без каких-либо оговорок.'
-    return head + filler + tail
+def test_plate_block_is_whole_paragraph():
+    '''Резка по точке ломается на инициалах: остаётся обрывок после «И. И.».'''
+    plate = plate_block(build_document())
+    check('plate_block возвращает абзац, а не обрывок',
+          plate is not None and 'настоящий материал' in plate,
+          'получено: ' + repr(plate))
 
 
-def test_head_plate_does_not_cover_other_person():
-    text = build_two_person_document()
-    start = text.index('Петрову')
-    hit = Hit(1, 'Петрова Мария Сергеевна', 0.55, start, start + 7, 'Петрову М. С.')
+def test_plate_block_absent():
+    text = 'Обычный текст без всяких оговорок и упоминаний.'
+    check('без маркера plate_block возвращает None', plate_block(text) is None)
+
+
+def test_named_in_plate():
+    plate = plate_block(build_document())
+    check('в плашке опознан Иванов', named_in_plate(plate, 'Иванов Иван Иванович'))
+    check('в плашке НЕ опознана Петрова', not named_in_plate(plate, 'Петрова Мария Сергеевна'))
+
+
+def test_person_inside_head_but_outside_window():
+    '''Ключевая регрессия. Петрова стоит внутри первых 800 символов,
+    но вне окна +-600 и не названа в плашке. Прежний код давал «покрыто».'''
+    text = build_document()
+    start = text.index('Петровой')
+    check('Петрова действительно попадает в первые 800 символов', start < 800,
+          'смещение: ' + str(start))
+    hit = Hit(1, 'Петрова Мария Сергеевна', 0.95, start, start + 8, 'Петровой М. С.')
     mark_hits(text, [hit], None)
-    check('плашка в шапке НЕ маркирует чужое упоминание', hit.marked is False)
+    check('упоминание в шапке, но не в плашке, остаётся непокрытым', hit.marked is False)
 
 
 def test_head_plate_covers_named_person():
-    text = build_two_person_document()
+    text = build_document()
     start = text.index('Ивановым')
-    hit = Hit(0, 'Иванов Иван Иванович', 0.55, start, start + 8, 'Ивановым И. И.')
+    hit = Hit(0, 'Иванов Иван Иванович', 0.95, start, start + 8, 'Ивановым И. И.')
     mark_hits(text, [hit], None)
-    check('плашка в шапке маркирует названное в ней лицо', hit.marked is True)
+    check('плашка маркирует названное в ней лицо', hit.marked is True)
 
 
 def test_marker_in_window():
@@ -151,7 +177,10 @@ def main():
     test_indeclinable()
     test_dates()
     test_short_surname_found_at_default_threshold()
-    test_head_plate_does_not_cover_other_person()
+    test_plate_block_is_whole_paragraph()
+    test_plate_block_absent()
+    test_named_in_plate()
+    test_person_inside_head_but_outside_window()
     test_head_plate_covers_named_person()
     test_marker_in_window()
     test_no_marker_anywhere()

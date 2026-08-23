@@ -212,36 +212,53 @@ def load_disclaimer(path):
     return norm(' '.join(body))[:80]
 
 
-def head_names_person(head, label):
-    '''Названо ли это лицо в шапке документа.'''
+def plate_block(text, disclaimer_core=None):
+    '''Абзац шапки, в котором стоит маркировка. None, если её там нет.
+
+    Границы ведутся ПО АБЗАЦАМ, а не по предложениям: инициалы вида
+    «И. И.» содержат точки, и резка по точке оставляет от плашки обрывок.
+
+    Раньше здесь стоял поиск фамилии по всем первым HEAD_CHARS символам.
+    Это давало ложное «покрыто»: лицо, упомянутое без оговорок на 682-м
+    символе, попадало в то же окно, что и плашка про совсем другого
+    человека. Именно такой репост — плашка вверху, цитата третьего лица
+    в середине — типичный рабочий случай, поэтому окно сужено до абзаца.
+    '''
+    for block in text[:HEAD_CHARS].split('\n'):
+        low = norm(block)
+        if any(marker in low for marker in STATUS_MARKERS):
+            return low
+        if disclaimer_core and disclaimer_core in low:
+            return low
+    return None
+
+
+def named_in_plate(plate, label):
+    if not plate:
+        return False
     parts = [p for p, _, _ in tokenize(label)]
     if not parts:
         return False
-    return any(form in head for form in surname_forms(parts[0]))
+    return any(form in plate for form in surname_forms(parts[0]))
 
 
 def mark_hits(text, hits, disclaimer_core):
     '''Маркировка засчитывается в двух случаях:
 
     1) маркер статуса или тело формы стоит в окне вокруг упоминания;
-    2) плашка стоит в шапке ДОКУМЕНТА И в этой же шапке названо
-       именно это лицо.
+    2) плашка стоит в абзаце шапки И в этом же абзаце названо это лицо.
 
-    Шапка больше НЕ покрывает все упоминания в тексте: плашка про
-    одного автора ничего не говорит о другом лице, упомянутом ниже.
+    Плашка про одного автора ничего не говорит о другом лице ниже.
     '''
-    head = norm(text[:HEAD_CHARS])
-    head_marked = any(m in head for m in STATUS_MARKERS)
-    if disclaimer_core and disclaimer_core in head:
-        head_marked = True
+    plate = plate_block(text, disclaimer_core)
     for hit in hits:
         left = max(0, hit.start - WINDOW_CHARS)
         window = norm(text[left:hit.end + WINDOW_CHARS])
         found = any(m in window for m in STATUS_MARKERS)
         if not found and disclaimer_core:
             found = disclaimer_core in window
-        if not found and head_marked:
-            found = head_names_person(head, hit.label)
+        if not found:
+            found = named_in_plate(plate, hit.label)
         hit.marked = found
     return hits
 
